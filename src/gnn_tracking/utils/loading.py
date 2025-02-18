@@ -41,6 +41,7 @@ class TrackingDataset(Dataset):
         sector: int | None = None,
         point_cloud_builder: PointCloudBuilder | None,
         feature_subset_names: list[str] | None = None,
+
     ):
         """Dataset for tracking applications
 
@@ -65,6 +66,7 @@ class TrackingDataset(Dataset):
             ]
         else:
             self.feature_subset = None
+
 
     def _get_paths(
         self,
@@ -129,6 +131,7 @@ class TrackingDataset(Dataset):
                 data.x = data.x[:, self.feature_subset]
             return data
 
+
         if self.point_cloud_builder.n_sectors == 1:
             return self.point_cloud_builder.process(idx, idx + 1)
 
@@ -156,6 +159,7 @@ class TrackingDataModule(LightningDataModule):
         cpus: int = 1,
         builder_params: dict | None = None,
         feature_subset_names: list[str] | None = None,
+
     ):
         """This subclass of `LightningDataModule` configures all data for the
         ML pipeline.
@@ -193,7 +197,6 @@ class TrackingDataModule(LightningDataModule):
         self._cpus = cpus
         self.builder_params = builder_params
         self.feature_subset_names = feature_subset_names
-
     @property
     def datasets(self) -> dict[str, TrackingDataset]:
         if not self._datasets:
@@ -229,6 +232,8 @@ class TrackingDataModule(LightningDataModule):
             raise ValueError(msg)
         point_cloud_builder = None
         if self.builder_params is not None:
+
+
             point_cloud_builder = PointCloudBuilder(**self.builder_params)
         return TrackingDataset(
             in_dir=in_dir,
@@ -237,6 +242,7 @@ class TrackingDataModule(LightningDataModule):
             sector=config.get("sector", None),
             point_cloud_builder=point_cloud_builder,  # Pass builder
             feature_subset_names=self.feature_subset_names,
+
         )
 
     def setup(self, stage: str) -> None:

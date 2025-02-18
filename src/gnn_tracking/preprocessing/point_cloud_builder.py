@@ -91,6 +91,7 @@ class PointCloudBuilder:
         add_true_edges: bool = False,
         return_data: bool = False,
         data_type: str = Literal["TrackML", "CMS_MC", "CMS_Run3"],
+
     ):
         """Build point clouds, that is, read the input data files and convert them
         to pytorch geometric data objects (without any edges yet).
@@ -134,6 +135,7 @@ class PointCloudBuilder:
         assert len(self.feature_names) == len(self.feature_scale)
         self.return_data = return_data
         self.data_type = data_type
+
         suffix = "-hits.csv.gz"
         self.ntuple = ""
         self.prefixes: list[Path] = []
@@ -361,6 +363,7 @@ class PointCloudBuilder:
         """
         for i in range(start, stop):
             self.logger.debug("Processing %s", i)
+
             try:
                 if self.data_type == "TrackML":
                     f = self.prefixes[i]
