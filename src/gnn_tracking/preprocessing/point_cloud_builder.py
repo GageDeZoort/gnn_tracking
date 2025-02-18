@@ -1,14 +1,18 @@
 """Build point clouds from the input data files."""
 
 import collections
+import itertools
 import logging
 import traceback
+from collections import defaultdict
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, Literal
 
+import awkward as ak
 import numpy as np
 import pandas as pd
 import torch
+import uproot
 from torch_geometric.data import Data
 
 import gnn_tracking.preprocessing.exatrkx_cell_features as ecf
@@ -18,23 +22,19 @@ pd.options.mode.chained_assignment = None  # default='warn'
 
 
 def get_truth_edge_index(pids: np.ndarray) -> np.ndarray:
-    """Get edge index for all edges, connecting hits of the same `particle_id`.
-    To save space, only edges in one direction are returned.
-    NB this assumes non-directional edges
-    """
-    pid_df = pd.DataFrame({"particle_id": pids, "index": list(range(len(pids)))})
-    pid_df = pid_df[pid_df["particle_id"] != 0]
-    # gets all the combinations within each particle_id
-    index_combos_within_pid = pid_df.merge(pid_df, on="particle_id")
-    # remove connections to itself and bi-directional edges
-    non_repeating_indices = index_combos_within_pid[
-        index_combos_within_pid["index_x"] != index_combos_within_pid["index_y"]
-    ]
-    non_repeating_indices[["index_x", "index_y"]] = np.sort(
-        non_repeating_indices[["index_x", "index_y"]].values, axis=1
-    )
-    non_repeating_indices = non_repeating_indices.drop_duplicates()
-    return non_repeating_indices[["index_x", "index_y"]].to_numpy().T
+    # Step 1: Store indices by particle ID in a dictionary
+
+    particle_indices = defaultdict(list)
+    for idx, pid in enumerate(pids):
+        if pid != 0:  # Skip particle ID 0
+            particle_indices[pid].append(idx)
+    # Step 2: Generate edges directly
+    edges = []
+    for indices in particle_indices.values():
+        if len(indices) < 2:
+            continue
+        edges.extend(itertools.combinations(indices, 2))
+    return np.array(edges).T
 
 
 DEFAULT_FEATURES = (
@@ -85,11 +85,13 @@ class PointCloudBuilder:
         remove_noise: bool = False,
         write_output: bool = True,
         log_level=logging.INFO,
-        collect_data: bool = True,
+        collect_data: bool = False,
         feature_names: tuple = DEFAULT_FEATURES,
         feature_scale: tuple = _DEFAULT_FEATURE_SCALE,
         add_true_edges: bool = False,
         return_data: bool = False,
+        data_type: str = Literal["TrackML", "CMS_MC", "CMS_Run3"],
+
     ):
         """Build point clouds, that is, read the input data files and convert them
         to pytorch geometric data objects (without any edges yet).
@@ -115,6 +117,7 @@ class PointCloudBuilder:
         """
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
+        self.initial_outdir = self.outdir
         self.indir = Path(indir)
         self.n_sectors = n_sectors
         self.redo = redo
@@ -131,21 +134,25 @@ class PointCloudBuilder:
         self.feature_scale = list(feature_scale)
         assert len(self.feature_names) == len(self.feature_scale)
         self.return_data = return_data
+        self.data_type = data_type
 
         suffix = "-hits.csv.gz"
+        self.ntuple = ""
         self.prefixes: list[Path] = []
         #: Does an output file for a given key exist?
         self.exists: dict[str, bool] = {}
         outfiles = [child.name for child in self.outdir.iterdir()]
         # Sort the files to keep unit tests fixed on different platforms
-        for p in sorted(self.indir.iterdir()):
-            if p.name.endswith(suffix):
-                prefix = p.name.replace(suffix, "")
-                evtid = int(prefix[-9:])
-                for s in range(self.n_sectors):
-                    key = f"data{evtid}_s{s}.pt"
-                    self.exists[key] = key in outfiles
-                self.prefixes.append(self.indir / prefix)
+        self.infiles = sorted(self.indir.iterdir())
+        if self.data_type == "TrackML":
+            for p in self.infiles:
+                if p.name.endswith(suffix):
+                    prefix = p.name.replace(suffix, "")
+                    evtid = int(prefix[-9:])
+                    for s in range(self.n_sectors):
+                        key = f"data{evtid}_s{s}.pt"
+                        self.exists[key] = key in outfiles
+                    self.prefixes.append(self.indir / prefix)
 
         self.data_list: list[Data] = []
         self.logger = get_logger("PointCloudBuilder", level=log_level)
@@ -159,9 +166,7 @@ class PointCloudBuilder:
         theta = np.arctan2(r, z)
         return -np.log(np.tan(theta / 2.0))
 
-    def restrict_to_subdetectors(
-        self, hits: pd.DataFrame, cells: pd.DataFrame
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def restrict_to_subdetectors(self, hits: pd.DataFrame) -> pd.DataFrame:
         """Rename (volume, layer) pairs with an integer label. If only pixel det, subset data"""
         pixel_barrel = [(8, 2), (8, 4), (8, 6), (8, 8)]
         pixel_LEC = [(7, 14), (7, 12), (7, 10), (7, 8), (7, 6), (7, 4), (7, 2)]
@@ -188,35 +193,24 @@ class PointCloudBuilder:
             new_layer_ids
         )
 
-        hits = hits.dropna(subset="layer")
-
-        cells = cells[cells.hit_id.isin(hits.hit_id)].copy()
-
-        return hits, cells
+        return hits
 
     def append_features(
         self,
         hits: pd.DataFrame,
-        particles: pd.DataFrame,
-        truth: pd.DataFrame,
-        cells: pd.DataFrame,
     ) -> pd.DataFrame:
         """Add additional features to the hits dataframe and return it."""
-        particles["pt"] = np.sqrt(particles.px**2 + particles.py**2)
-        particles["eta_pt"] = self.calc_eta(particles.pt, particles.pz)
 
-        # handle noise
-        truth_noise = truth[["hit_id", "particle_id"]][truth.particle_id == 0]
-        truth_noise["pt"] = 0
-        truth = truth[["hit_id", "particle_id"]].merge(
-            particles[["particle_id", "pt", "eta_pt", "q", "vx", "vy"]],
-            on="particle_id",
-        )
+        hits["r"] = np.sqrt(hits.x**2 + hits.y**2)
+        hits["phi"] = np.arctan2(hits.y, hits.x)
+        hits["eta_rz"] = self.calc_eta(hits.r, hits.z)
+        hits["u"] = hits["x"] / (hits["x"] ** 2 + hits["y"] ** 2)
+        hits["v"] = hits["y"] / (hits["x"] ** 2 + hits["y"] ** 2)
+        return hits
 
-        # optionally add noise
-        if not self.remove_noise:
-            truth = pd.concat([truth, truth_noise])
-
+    def append_cell_features(
+        self, hits: pd.DataFrame, cells: pd.DataFrame
+    ) -> pd.DataFrame:
         # add in channel-specific info
         cells_agg = cells.groupby(["hit_id"]).agg(
             charge_sum=pd.NamedAgg(column="value", aggfunc="sum"),
@@ -225,19 +219,7 @@ class PointCloudBuilder:
         cells_agg["charge_frac"] = cells_agg.charge_sum / cells_agg.channel_counts
         hits = pd.merge(hits, cells_agg, on="hit_id", how="left")
 
-        hits = ecf.augment_hit_features(hits, cells, detector_proc=self._detector)
-
-        # append volume labels as one-hot features to X
-        volume_labels = ["V7", "V8", "V9", "V12", "V13", "V14", "V16", "V17", "V18"]
-        for v in volume_labels:
-            hits[v] = (hits.volume_id == int(v[1:])).astype(int)
-
-        hits["r"] = np.sqrt(hits.x**2 + hits.y**2)
-        hits["phi"] = np.arctan2(hits.y, hits.x)
-        hits["eta_rz"] = self.calc_eta(hits.r, hits.z)
-        hits["u"] = hits["x"] / (hits["x"] ** 2 + hits["y"] ** 2)
-        hits["v"] = hits["y"] / (hits["x"] ** 2 + hits["y"] ** 2)
-        return hits.merge(truth[["hit_id", "particle_id", "pt", "eta_pt"]], on="hit_id")
+        return ecf.augment_hit_features(hits, cells, detector_proc=self._detector)
 
     def sector_hits(
         self, hits: pd.DataFrame, sector_id: int, particle_id_counts: dict[int, int]
@@ -342,7 +324,7 @@ class PointCloudBuilder:
             ),
             edge_index=self._get_edge_index(hits["particle_id"].values),
             y=torch.zeros(0).float(),
-            layer=torch.tensor(hits.layer.values).long(),
+            layer=torch.tensor(hits.layer_id.values).long(),
             particle_id=torch.tensor(hits["particle_id"].values).long(),
             pt=torch.tensor(hits["pt"].values).float(),
             reconstructable=torch.tensor(hits["reconstructable"].values).long(),
@@ -364,7 +346,7 @@ class PointCloudBuilder:
 
     def process(
         self,
-        start: int | None = None,
+        start: int | None = 0,
         stop: int | None = None,
         ignore_loading_errors=False,
     ):
@@ -379,23 +361,23 @@ class PointCloudBuilder:
         Returns:
 
         """
-
-        for f in self.prefixes[start:stop]:
-            self.logger.debug("Processing %s", f)
-
-            evtid = int(f.name[-9:])
+        for i in range(start, stop):
+            self.logger.debug("Processing %s", i)
 
             try:
-                hits, particles, truth, cells = simple_data_loader(f)
+                if self.data_type == "TrackML":
+                    f = self.prefixes[i]
+                    evtid = int(f.name[-9:])
+                    hits = self.read_trackml(f)
+                elif self.data_type == "CMS_MC":
+                    evtid = i
+                    hits = self.read_cms_mc(i)
             except Exception:
                 if ignore_loading_errors:
                     self.logger.error("Error loading event %d", evtid)
                     self.logger.error(traceback.format_exc())
                     continue
                 raise
-
-            hits, cells = self.restrict_to_subdetectors(hits, cells)
-            hits = self.append_features(hits, particles, truth, cells)
 
             pid_layer_count = (
                 hits.groupby("particle_id")
@@ -418,9 +400,11 @@ class PointCloudBuilder:
 
             for s in range(self.n_sectors):
                 name = f"data{evtid}_s{s}.pt"
-                if self.exists[name] and not self.redo:
+                # not implemented with CMS yet
+                if self.data_type == "TrackML" and self.exists[name] and not self.redo:
                     if self._collect_data:
                         data = torch.load(self.outdir / name)
+                        # this append can slow the code down too much
                         self.data_list.append(data)
                     self.logger.debug("skipping %s", name)
                     continue
@@ -449,6 +433,9 @@ class PointCloudBuilder:
                 "n_sector_particles": n_sector_particles,
             }
 
+            for var in list(locals().keys()):  # Use list() to avoid RuntimeError
+                del locals()[var]  # Deleting variable from local scope
+
         self.logger.debug("Output statistics: %s", self.stats[evtid])
         if self.measurement_mode:
             measurements = pd.DataFrame(self.measurements)
@@ -458,22 +445,102 @@ class PointCloudBuilder:
                 _ = f"{var}: {means[var]:.4f}+/-{stds[var]:.4f}"
                 self.logger.debug(_)
 
-        if self.return_data and self.n_sectors > 1:
-            graph_out = sector_list
-        elif self.return_data:
-            graph_out = sector
-        else:
-            graph_out = None
-        return graph_out
+    # this speeds up the code slightly, if need more capability, use from trackml.dataset import load_event
+    def read_trackml(self, f):
+        f = str(f)
+        suffix = ".csv.gz"
+        cells = pd.read_csv(f + "-cells" + suffix, header=0, index_col=False)
+        hits = pd.read_csv(f + "-hits" + suffix, header=0, index_col=False)
+        truth = pd.read_csv(f + "-truth" + suffix, header=0, index_col=False)
+        particles = pd.read_csv(f + "-particles" + suffix, header=0, index_col=False)
 
+        hits = self.restrict_to_subdetectors(hits)
+        hits = hits.dropna(subset="layer")
 
-# this speeds up the code slightly, if need more capability, use from trackml.dataset import load_event
-def simple_data_loader(f):
-    f = str(f)
-    suffix = ".csv.gz"
-    cells = pd.read_csv(f + "-cells" + suffix, header=0, index_col=False)
-    hits = pd.read_csv(f + "-hits" + suffix, header=0, index_col=False)
-    truth = pd.read_csv(f + "-truth" + suffix, header=0, index_col=False)
-    particles = pd.read_csv(f + "-particles" + suffix, header=0, index_col=False)
+        cells = cells[cells.hit_id.isin(hits.hit_id)].copy()
+        # handle noise
+        truth_noise = truth[["hit_id", "particle_id"]][truth.particle_id == 0]
+        truth_noise["pt"] = 0
+        particles["pt"] = np.sqrt(particles.px**2 + particles.py**2)
+        particles["eta_pt"] = self.calc_eta(particles.pt, particles.pz)
+        truth = truth[["hit_id", "particle_id"]].merge(
+            particles[["particle_id", "pt", "eta_pt", "q", "vx", "vy"]],
+            on="particle_id",
+        )
 
-    return hits, particles, truth, cells
+        # optionally add noise
+        if not self.remove_noise:
+            truth = pd.concat([truth, truth_noise])
+
+        hits = self.append_cell_features(hits, cells)
+        hits = self.append_features(hits)
+
+        hits = hits.merge(truth[["hit_id", "particle_id", "pt", "eta_pt"]], on="hit_id")
+
+        # append volume labels as one-hot features to X
+        volume_labels = ["V7", "V8", "V9", "V12", "V13", "V14", "V16", "V17", "V18"]
+        for v in volume_labels:
+            hits[v] = (hits.volume_id == int(v[1:])).astype(int)
+
+        return hits
+
+    def read_cms_mc(self, evt_num):
+        # the event numbering in each file starts from zero
+        file_evt_num = evt_num - int(evt_num / 1000) * 1000
+        if evt_num % 1000 == 0 or self.ntuple == "":
+            self.ntuple, self.key, self.hit_key, self.cell_key = (
+                self.load_new_cms_mc_file(evt_num)
+            )
+            subdir = Path(f"part_{int(evt_num/1000)}")
+            self.outdir = self.initial_outdir / subdir
+            # Create the directory if it doesn't exist
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        hits = ak.to_dataframe(
+            self.ntuple[self.key][self.hit_key].arrays(
+                entry_start=file_evt_num, entry_stop=file_evt_num + 1
+            )
+        )
+        cells = ak.to_dataframe(
+            self.ntuple[self.key][self.cell_key].arrays(
+                entry_start=file_evt_num, entry_stop=file_evt_num + 1
+            )
+        )
+        cells = cells.rename({"charge_value": "value"}, axis=1)
+        assert len(hits) > 0, f"the hits in event {evt_num} are empty "
+        hits = hits.rename({"sim_pt": "pt", "sim_eta": "eta_pt"}, axis=1)
+        # fake particles are -1 here, was 0 in trackml
+        # in root files, background hits don't have a pid, so assign one by grouping on pt
+        signal = hits[hits["particle_id"] > 0]
+        background = hits[hits["particle_id"] == -1]
+        assert len(signal) + len(background) == len(hits)
+        background_by_pt = (
+            background[["particle_id", "pt"]].value_counts().reset_index()
+        )
+        background_by_pt["particle_id"] = list(
+            range(-1, -len(background_by_pt) - 1, -1)
+        )
+        background_w_pid = background.drop("particle_id", axis=1).merge(
+            background_by_pt, on="pt"
+        )
+        hits_w_bkg_pid = pd.concat(
+            [signal, background_w_pid.drop("count", axis=1)], axis=0
+        )
+        hits = self.append_cell_features(hits_w_bkg_pid, cells)
+        if self.pixel_only:
+            hits = hits[hits["volume_id"].isin([1, 2, 3])]
+        return self.append_features(hits)
+
+    def load_new_cms_mc_file(self, evt_num):
+        # each file contains 1000 events
+        file_number = evt_num // 1000 + 1
+        ntuple_file = uproot.open(self.indir + "ntuple_" + str(file_number) + ".root")
+        # each file will have unique keys
+        ntuple_key = list(ntuple_file.keys()[0])
+        sub_keys = ntuple_file[ntuple_key].keys()
+        hit_key = next(x for x in sub_keys if x.startswith("hits"))
+        cell_key = next(x for x in sub_keys if x.startswith("cell"))
+        return ntuple_file, ntuple_key, hit_key, cell_key
+
+    def read_cms_run3(self, f):
+        err_msg = f"You passed a file {f}, but CMS Run 3 data is not implemented yet"
+        raise NotImplementedError(err_msg)

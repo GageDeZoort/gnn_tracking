@@ -12,6 +12,23 @@ from torch_geometric.loader import DataLoader
 from gnn_tracking.preprocessing.point_cloud_builder import PointCloudBuilder
 from gnn_tracking.utils.log import logger
 
+DEFAULT_FEATURES = (
+    "r",
+    "phi",
+    "z",
+    "eta_rz",
+    "u",
+    "v",
+    "charge_frac",
+    "leta",
+    "lphi",
+    "lx",
+    "ly",
+    "lz",
+    "geta",
+    "gphi",
+)
+
 
 # noinspection PyAbstractClass
 class TrackingDataset(Dataset):
@@ -23,6 +40,8 @@ class TrackingDataset(Dataset):
         stop=None,
         sector: int | None = None,
         point_cloud_builder: PointCloudBuilder | None,
+        feature_subset_names: list[str] | None = None,
+
     ):
         """Dataset for tracking applications
 
@@ -35,12 +54,19 @@ class TrackingDataset(Dataset):
         """
         super().__init__()
         self.point_cloud_builder = point_cloud_builder
-
         self._processed_paths = self._get_paths(
             in_dir, start=start, stop=stop, sector=sector
         )
         self.file_number = 0
         self.prev_file_number = -1
+        self.sector_results = []
+        if feature_subset_names is not None:
+            self.feature_subset = [
+                DEFAULT_FEATURES.index(name) for name in feature_subset_names
+            ]
+        else:
+            self.feature_subset = None
+
 
     def _get_paths(
         self,
@@ -97,7 +123,14 @@ class TrackingDataset(Dataset):
     def get(self, idx: int) -> Data:
         # slightly funky logic to load each sector on the fly without re-processing each file
         if self.point_cloud_builder is None:
-            return torch.load(self._processed_paths[idx])
+            data = torch.load(self._processed_paths[idx])
+            if self.feature_subset is not None:
+                if data.x.shape[1] < len(self.feature_subset):
+                    msg = f"error in file {self._processed_paths[idx]}"
+                    raise ValueError(msg)
+                data.x = data.x[:, self.feature_subset]
+            return data
+
 
         if self.point_cloud_builder.n_sectors == 1:
             return self.point_cloud_builder.process(idx, idx + 1)
@@ -122,8 +155,11 @@ class TrackingDataModule(LightningDataModule):
         train: dict | None = None,
         val: dict | None = None,
         test: dict | None = None,
+        predict: dict | None = None,
         cpus: int = 1,
-        builder_params: dict | None = None,  # New Parameter
+        builder_params: dict | None = None,
+        feature_subset_names: list[str] | None = None,
+
     ):
         """This subclass of `LightningDataModule` configures all data for the
         ML pipeline.
@@ -155,11 +191,12 @@ class TrackingDataModule(LightningDataModule):
             "train": self._fix_datatypes(train),
             "val": self._fix_datatypes(val),
             "test": self._fix_datatypes(test),
+            "predict": self._fix_datatypes(predict),
         }
         self._datasets = {}
         self._cpus = cpus
         self.builder_params = builder_params
-
+        self.feature_subset_names = feature_subset_names
     @property
     def datasets(self) -> dict[str, TrackingDataset]:
         if not self._datasets:
@@ -194,7 +231,9 @@ class TrackingDataModule(LightningDataModule):
             msg = f"DataLoaderConfig for key {key} is None."
             raise ValueError(msg)
         point_cloud_builder = None
-        if self.builder_params:
+        if self.builder_params is not None:
+
+
             point_cloud_builder = PointCloudBuilder(**self.builder_params)
         return TrackingDataset(
             in_dir=in_dir,
@@ -202,6 +241,8 @@ class TrackingDataModule(LightningDataModule):
             stop=config.get("stop", None),
             sector=config.get("sector", None),
             point_cloud_builder=point_cloud_builder,  # Pass builder
+            feature_subset_names=self.feature_subset_names,
+
         )
 
     def setup(self, stage: str) -> None:
@@ -212,6 +253,8 @@ class TrackingDataModule(LightningDataModule):
             self._datasets["val"] = self._get_dataset("val")
         elif stage == "test":
             self._datasets["test"] = self._get_dataset("test")
+        elif stage == "predict":
+            self._datasets["predict"] = self._get_dataset("predict")
         else:
             _ = f"Unknown stage '{stage}'"
             raise ValueError(_)
@@ -246,6 +289,9 @@ class TrackingDataModule(LightningDataModule):
 
     def test_dataloader(self):
         return self._get_dataloader("test")
+
+    def predict_dataloader(self):
+        return self._get_dataloader("predict")
 
 
 class TestTrackingDataModule(LightningDataModule):
